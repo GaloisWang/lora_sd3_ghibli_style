@@ -1,0 +1,12 @@
+{
+    "image_dir": "/root/autodl-tmp/HuggingFace_Datasets/Nechintosh--ghibli/Nechintosh_ghibli/",
+    "captions_dir": "/root/autodl-tmp/HuggingFace_Datasets/Nechintosh--ghibli/captions_gstyle/",
+    "output_dir": "/home/lora_sd3_train_logs_fulldata_060216e5",
+    "epochs":30,
+    "learning_rate": 1e-5,
+    "train_batch_size": 1,
+    "rank": 16,
+    "lora_alpha": 16,
+    "pretrained_model_path": "/root/autodl-tmp/models/stabilityai--stable-diffusion-3-medium-diffusers/",
+    "resolution": 1024
+}
