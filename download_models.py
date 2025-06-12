@@ -7,51 +7,59 @@ from tqdm import tqdm
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+
 def download_model(repo_id, save_dir, token=None):
     print(f"\nStarting download for model: {repo_id}")
     try:
-        snapshot_download(repo_id=repo_id,
-                          repo_type="model",
-                          cache_dir=save_dir,
-                          local_dir=os.path.join(save_dir, repo_id.replace("/", "--")),
-                          token=token,
-                          )
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            cache_dir=save_dir,
+            local_dir=os.path.join(save_dir, repo_id.replace("/", "--")),
+            token=token,
+        )
         print(f"Successfully downloaded or updated model: {repo_id}")
     except Exception as e:
         print(f"Error downloading model {repo_id}: {e}")
+
 
 def NetTurbo():
     import subprocess
     import os
 
-    result = subprocess.run('bash -c "source /etc/network_turbo && env | grep proxy"', shell=True, capture_output=True, text=True)
+    result = subprocess.run(
+        'bash -c "source /etc/network_turbo && env | grep proxy"',
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
     output = result.stdout
     for line in output.splitlines():
-        if '=' in line:
-            var, value = line.split('=', 1)
+        if "=" in line:
+            var, value = line.split("=", 1)
             os.environ[var] = value
+
 
 if __name__ == "__main__":
     NetTurbo()
 
-    os.environ['HF_ENDPOINT'] = "hf-cdn.sufy.com"
-
+    os.environ["HF_ENDPOINT"] = "hf-cdn.sufy.com"
     hf_token = os.environ.get("HUGGINGFACE_TOKEN")
     HfFolder.save_token(hf_token)
 
+    base_save_dir = "/root/autodl-tmp/models/"
+    model_repo_ids = ["stabilityai/stable-diffusion-3-medium-diffusers"]
+
+    os.makedirs(base_save_dir, exist_ok=True)
     try:
         login(token=hf_token)
         print("Hugging Face login successful.")
     except Exception as e:
-        print(f"Hugging Face login failed: {e}. Downloads might rely on cached credentials or public access.")
-
-    base_save_dir = "/home/models/" # 修改为保存模型的父目录
-    os.makedirs(base_save_dir, exist_ok=True)
-
-    model_repo_ids = ["MohamedRashad/sd3-civitai-lora"]
+        print(
+            f"Hugging Face login failed: {e}. Downloads might rely on cached credentials or public access."
+        )
 
     unique_model_repo_ids = sorted(list(set(model_repo_ids)))
-
     print(f"Found {len(unique_model_repo_ids)} unique models to download.")
 
     for repo_id in tqdm(unique_model_repo_ids, desc="Downloading models"):

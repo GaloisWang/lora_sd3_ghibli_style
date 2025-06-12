@@ -4,16 +4,33 @@ import os
 import torch
 import gc
 import math
+import numpy as np
 
-# import torch.nn.functional as F
+from datetime import datetime
 from PIL import Image
-
 from dataclasses import dataclass
-from diffusers import StableDiffusion3Pipeline, FlowMatchEulerDiscreteScheduler
+from diffusers import (
+    AutoencoderKL,
+    StableDiffusion3Pipeline,
+    SD3Transformer2DModel,
+    FlowMatchEulerDiscreteScheduler,
+)
 
-# from diffusers.training_utils import get_noise_sampler
+from diffusers.training_utils import (
+    _set_state_dict_into_text_encoder,
+    cast_training_params,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
+
 from omegaconf import OmegaConf
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import (
+    get_peft_model,
+    LoraConfig,
+    TaskType,
+    get_peft_model_state_dict,
+    PeftModel,
+)
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -23,7 +40,11 @@ from transformers import (
     CLIPTokenizer,
     CLIPTextModel,
     CLIPTextModelWithProjection,
-)  # 导入用于处理SD3多文本编码器的模型和分词器
+)
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from diffusers.utils.torch_utils import is_compiled_module
 
 
 @dataclass
@@ -34,20 +55,92 @@ class TrainParametersConfig:
     epochs: int = 200
     learning_rate: float = 1e-4
     train_batch_size: int = 8
+    gradient_accumulation_steps: int = 4
     rank: int = 8
     lora_alpha: int = 16
     pretrained_model_path: str = "stabilityai/stable-diffusion-3-medium-diffusers"
     resolution: int = 512
 
+    mixed_precision: str = "fp16"  # 可以是 "no", "fp16", "bf16"
+    seed: int = 1337
+    dataloader_num_workers: int = 2
+    max_grad_norm: float = 1.0
+    save_every_n_epochs: int = 10
+
 
 def load_training_config(config_path: str) -> TrainParametersConfig:
-    ## 从json文件中加载训练参数配置
+    """从json文件中加载训练参数配置"""
     data_dict = OmegaConf.load(config_path)
     return TrainParametersConfig(**data_dict)
 
 
+def _encode_prompt_with_t5(text_encoder, input_ids, device=None):
+    prompt_embeds = text_encoder(input_ids.to(device))[0]
+    dtype = text_encoder.dtype
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    return prompt_embeds
+
+
+def _encode_prompt_with_clip(text_encoder, input_ids, device=None):
+    prompt_embeds = text_encoder(input_ids.to(device), output_hidden_states=True)
+    pooled_prompt_embeds = prompt_embeds[0]
+    prompt_embeds = prompt_embeds.hidden_states[-2]
+    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def encode_prompt(
+    text_encoders, input_ids_one, input_ids_two, input_ids_three, device=None
+):
+    clip_text_encoder_one = text_encoders[0]
+    prompt_embeds_one, pooled_prompt_embeds_one = _encode_prompt_with_clip(
+        text_encoder=clip_text_encoder_one,
+        input_ids=input_ids_one,
+        device=device if device is not None else clip_text_encoder_one.device,
+    )
+
+    clip_text_encoder_two = text_encoders[1]
+    prompt_embeds_two, pooled_prompt_embeds_two = _encode_prompt_with_clip(
+        text_encoder=clip_text_encoder_two,
+        input_ids=input_ids_two,
+        device=device if device is not None else clip_text_encoder_two.device,
+    )
+
+    t5_text_encoder = text_encoders[2]
+    t5_prompt_embed = _encode_prompt_with_t5(
+        text_encoder=t5_text_encoder,
+        input_ids=input_ids_three,
+        device=device if device is not None else t5_text_encoder.device,
+    )
+
+    clip_prompt_embeds = torch.cat([prompt_embeds_one, prompt_embeds_two], dim=-1)
+    pooled_prompt_embeds = torch.cat(
+        [pooled_prompt_embeds_one, pooled_prompt_embeds_two], dim=-1
+    )
+
+    clip_prompt_embeds = torch.nn.functional.pad(
+        clip_prompt_embeds,
+        (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1]),
+    )
+    prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def compute_text_embeddings(
+    text_encoders, input_ids_one, input_ids_two, input_ids_three, device
+):
+    with torch.no_grad():
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(
+            text_encoders=text_encoders,
+            input_ids_one=input_ids_one,
+            input_ids_two=input_ids_two,
+            input_ids_three=input_ids_three,
+            device=device,
+        )
+    return prompt_embeds, pooled_prompt_embeds
+
+
 class Text2ImageDataset(torch.utils.data.Dataset):
-    # 【关键修复】创建tokenizer引用供dataset使用  
     def __init__(self, image_dir, captions_dir, pretrained_model_path, resolution):
         self.image_paths = []
         self.image_paths.extend(
@@ -70,18 +163,9 @@ class Text2ImageDataset(torch.utils.data.Dataset):
 
         self.captions = captions
         self.resolution = resolution
-        # 注意：这里仅用于获取 image_processor 和 tokenizer，避免完整加载 pipeline 占用过多内存
-        # 如果内存允许，或者需要 pipeline 的其他功能，可以保留
-        # 为了减少初始化时的内存占用，我们分别加载tokenizer和processor
-        self.processor = StableDiffusion3Pipeline.from_pretrained(
-            pretrained_model_path,
-            use_safetensors=True,
-            torch_dtype=torch.float16, # 指定torch_dtype以减少内存
-            low_cpu_mem_usage=True # 尝试进一步减少CPU内存使用
-        ).image_processor
 
         self.tokenizer_one = CLIPTokenizer.from_pretrained(
-            pretrained_model_path, subfolder="tokenizer" # SD3 medium的tokenizer通常在 'tokenizer', 'tokenizer_2', 'tokenizer_3'
+            pretrained_model_path, subfolder="tokenizer"
         )
         self.tokenizer_two = CLIPTokenizer.from_pretrained(
             pretrained_model_path, subfolder="tokenizer_2"
@@ -89,14 +173,6 @@ class Text2ImageDataset(torch.utils.data.Dataset):
         self.tokenizer_three = T5Tokenizer.from_pretrained(
             pretrained_model_path, subfolder="tokenizer_3"
         )
-
-        # 显式卸载临时的完整pipeline（如果之前加载了）
-        # import gc
-        # del sd3_pipeline_temp 
-        # gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
 
     def __len__(self):
         return len(self.image_paths)
@@ -109,13 +185,12 @@ class Text2ImageDataset(torch.utils.data.Dataset):
         top = (h - crop) // 2
         img = img.crop((left, top, left + crop, top + crop))
         img = img.resize((self.resolution, self.resolution), Image.BICUBIC)
-        
-        # 【修复】标准化像素值到[-1, 1]范围
-        import numpy as np
+
+        # 标准化像素值到[-1, 1]范围
         pixel_values = np.array(img).astype(np.float32) / 255.0
         pixel_values = (pixel_values - 0.5) * 2.0  # 归一化到[-1, 1]
         pixel_values = torch.from_numpy(pixel_values).permute(2, 0, 1)  # HWC -> CHW
-        
+
         prompt = self.captions[idx]
 
         input_ids_one = self.tokenizer_one(
@@ -151,324 +226,340 @@ class Text2ImageDataset(torch.utils.data.Dataset):
 
 
 def main(train_configs):
-    if train_configs.output_dir is not None:
-        os.makedirs(os.path.abspath(train_configs.output_dir), exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(log_dir=os.path.join(train_configs.output_dir, "logs"))
-    global_step = 0
+    project_config = ProjectConfiguration(
+        project_dir=train_configs.output_dir,
+        logging_dir=os.path.join(train_configs.output_dir, "logs"),
+    )
 
-    # 【修复】更高效的模型加载方式
-    print("加载VAE...")
-    from diffusers import AutoencoderKL
+    accelerator = Accelerator(
+        gradient_accumulation_steps=train_configs.gradient_accumulation_steps,
+        mixed_precision=train_configs.mixed_precision,
+        log_with="tensorboard",
+        project_config=project_config,
+    )
+
+    if train_configs.seed is not None:
+        set_seed(train_configs.seed)
+
+    logger = get_logger(__name__)
+
+    if accelerator.is_main_process:
+        if train_configs.output_dir is not None:
+            os.makedirs(train_configs.output_dir, exist_ok=True)
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    logger.info("加载VAE...")
     vae = AutoencoderKL.from_pretrained(
-        train_configs.pretrained_model_path, 
+        train_configs.pretrained_model_path,
         subfolder="vae",
-        torch_dtype=torch.float16,
-        use_safetensors=True
-    ).to(device)
-    
-    print("加载MMDiT transformer...")
-    from diffusers import SD3Transformer2DModel
+        torch_dtype=torch.float32,
+        use_safetensors=True,
+    )
+    vae = vae.to(accelerator.device)
+
+    logger.info("加载MMDiT transformer...")
     mmdit = SD3Transformer2DModel.from_pretrained(
         train_configs.pretrained_model_path,
         subfolder="transformer",
-        torch_dtype=torch.float16,
-        use_safetensors=True
-    ).to(device)
+        torch_dtype=weight_dtype,
+        use_safetensors=True,
+    )
 
-    print("加载文本编码器...")
-    text_encoder_one = CLIPTextModel.from_pretrained(
+    logger.info("加载文本编码器...")
+    text_encoder_one = CLIPTextModelWithProjection.from_pretrained(
         train_configs.pretrained_model_path,
         subfolder="text_encoder",
-        torch_dtype=torch.float16,
+        torch_dtype=weight_dtype,
         use_safetensors=True,
-    ).to(device)
+    )
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
         train_configs.pretrained_model_path,
         subfolder="text_encoder_2",
-        torch_dtype=torch.float16,
+        torch_dtype=weight_dtype,
         use_safetensors=True,
-    ).to(device)
+    )
     text_encoder_three = T5EncoderModel.from_pretrained(
         train_configs.pretrained_model_path,
         subfolder="text_encoder_3",
-        torch_dtype=torch.float16,
+        torch_dtype=weight_dtype,
         use_safetensors=True,
-    ).to(device)
+    )
 
-    # 冻结原始模型参数
+    text_encoder_one = text_encoder_one.to(accelerator.device)
+    text_encoder_two = text_encoder_two.to(accelerator.device)
+    text_encoder_three = text_encoder_three.to(accelerator.device)
+
+    mmdit.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
-    mmdit.requires_grad_(False)
 
-    # 【修复】确保LoRA目标模块名称正确
-    print("配置LoRA...")
+    text_encoder_one.eval()
+    text_encoder_two.eval()
+    text_encoder_three.eval()
+
+    logger.info("配置LoRA...")
     lora_config = LoraConfig(
         r=train_configs.rank,
         lora_alpha=train_configs.lora_alpha,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],  # SD3 MMDiT的标准注意力层
         init_lora_weights="gaussian",
-        bias="none",
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
     )
     mmdit = get_peft_model(mmdit, lora_config)
-    mmdit.print_trainable_parameters()
 
-    ghibli_dataset = Text2ImageDataset(
+    if accelerator.is_main_process:
+        mmdit.print_trainable_parameters()
+
+    optimizer = torch.optim.AdamW(
+        mmdit.parameters(),
+        lr=train_configs.learning_rate,
+        weight_decay=1e-04,
+        eps=1e-08,
+        betas=(0.9, 0.999),
+    )
+
+    dataset = Text2ImageDataset(
         train_configs.image_dir,
         train_configs.captions_dir,
         train_configs.pretrained_model_path,
         train_configs.resolution,
     )
+
     dataloader = DataLoader(
-        ghibli_dataset, 
-        batch_size=train_configs.train_batch_size, 
+        dataset,
+        batch_size=train_configs.train_batch_size,
         shuffle=True,
-        num_workers=2,  # 【修复】添加多进程数据加载
-        pin_memory=True
-    )
-    
-    # 优化器只包含LoRA参数 - 【关键修复1】降低学习率
-    optimizer = torch.optim.AdamW(
-        mmdit.parameters(),  # 【修复】只获取可训练参数
-        lr=train_configs.learning_rate * 0.1,  # 【关键修复】大幅降低学习率
-        weight_decay=0.01,  # 【修复】添加权重衰减
-        eps=1e-8,  # 【关键修复】增加epsilon防止除零
-        betas=(0.9, 0.999)  # 标准beta值
+        num_workers=train_configs.dataloader_num_workers,
     )
 
-    # 【修复】添加学习率调度器 - 【关键修复2】使用更温和的调度器
-    from torch.optim.lr_scheduler import ReduceLROnPlateau
-    scheduler = ReduceLROnPlateau(
-        optimizer, 
-        mode='min',
-        factor=0.5,
-        patience=5,
-        min_lr=1e-7,
-        verbose=True
+    num_update_steps_per_epoch = math.ceil(
+        len(dataloader) / train_configs.gradient_accumulation_steps
     )
+    max_train_steps = train_configs.epochs * num_update_steps_per_epoch
 
-    # 训练循环
-    mmdit.train()
+    mmdit, optimizer, dataloader = accelerator.prepare(mmdit, optimizer, dataloader)
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers("sd3_lora_training")
+
+    logger.info("***** 训练信息 *****")
+    logger.info(f"  数据集样本数 = {len(dataset)}")
+    logger.info(f"  训练轮数 = {train_configs.epochs}")
+    logger.info(f"  单设备批次大小 = {train_configs.train_batch_size}")
+    logger.info(
+        f"  总批次大小 = {train_configs.train_batch_size * accelerator.num_processes}"
+    )
+    logger.info(f"  梯度累积步数 = {train_configs.gradient_accumulation_steps}")
+    logger.info(f"  总优化步数 = {max_train_steps}")
+    logger.info(f"  混合精度 = {train_configs.mixed_precision}")
+
+    global_step = 0
+    first_epoch = 0
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         train_configs.pretrained_model_path, subfolder="scheduler"
     )
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
-    print("\n开始训练循环...")
-    
-    # 【关键修复3】添加梯度累积
-    gradient_accumulation_steps = 4
-    effective_batch_size = train_configs.train_batch_size * gradient_accumulation_steps
-    
-    for epoch in range(train_configs.epochs):
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    for epoch in range(first_epoch, train_configs.epochs):
+        mmdit.train()
         epoch_loss = 0.0
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{train_configs.epochs}")
-        
+
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch+1}/{train_configs.epochs}",
+            disable=not accelerator.is_local_main_process,
+        )
+
         for step, batch in enumerate(progress_bar):
-            pixel_values = batch["pixel_values"].to(device, dtype=torch.float16)
-
-            input_ids_one = batch["input_ids_one"].to(device)
-            input_ids_two = batch["input_ids_two"].to(device)
-            input_ids_three = batch["input_ids_three"].to(device)
-
-            # VAE编码
-            with torch.no_grad():
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-
-            # 文本编码
-            with torch.no_grad():
-                # CLIP Text Encoder L
-                text_encoder_one_output = text_encoder_one(
-                    input_ids_one, return_dict=True
+            with accelerator.accumulate(mmdit):
+                pixel_values = batch["pixel_values"].to(dtype=torch.float32)
+                input_ids_one = batch["input_ids_one"]
+                input_ids_two = batch["input_ids_two"]
+                input_ids_three = batch["input_ids_three"]
+                prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                    text_encoders=[
+                        text_encoder_one,
+                        text_encoder_two,
+                        text_encoder_three,
+                    ],
+                    input_ids_one=input_ids_one,
+                    input_ids_two=input_ids_two,
+                    input_ids_three=input_ids_three,
+                    device=accelerator.device,
                 )
-                text_embeds_one = text_encoder_one_output.last_hidden_state 
-                
-                # 【关键修复】CLIPTextModel没有pooler_output，需要手动计算
-                # 使用最后一个非padding token的hidden state作为pooled embedding
-                # 对于CLIP，通常使用序列中最后一个有效token
-                attention_mask_one = (input_ids_one != 49407).float()  # 49407是CLIP的pad_token_id
-                sequence_lengths = attention_mask_one.sum(dim=1).long() - 1
-                batch_indices = torch.arange(text_embeds_one.shape[0], device=text_embeds_one.device)
-                pooled_prompt_embeds_one = text_embeds_one[batch_indices, sequence_lengths]
 
-                # CLIP Text Encoder G
-                text_encoder_two_output = text_encoder_two(
-                    input_ids_two, return_dict=True
+                with torch.no_grad():
+                    model_input = vae.encode(pixel_values).latent_dist.sample()
+                    model_input = (
+                        model_input - vae.config.shift_factor
+                    ) * vae.config.scaling_factor
+
+                noise = torch.randn_like(model_input)
+                bsz = model_input.shape[0]
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme="logit_normal",
+                    batch_size=bsz,
+                    logit_mean=0.0,
+                    logit_std=1.0,
+                    mode_scale=1.29,
                 )
-                text_embeds_two = text_encoder_two_output.last_hidden_state
-                pooled_prompt_embeds_two = text_encoder_two_output.text_embeds
-
-                # 拼接pooled outputs
-                pooled_projections_final = torch.cat(
-                    [pooled_prompt_embeds_one, pooled_prompt_embeds_two], dim=-1
-                ).to(dtype=torch.float16)
-
-                # T5 Text Encoder
-                text_encoder_three_output = text_encoder_three(
-                    input_ids_three, return_dict=True
+                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(
+                    device=model_input.device
                 )
-                text_embeds_three = text_encoder_three_output.last_hidden_state
 
-                # 构建encoder_hidden_states
-                clip_combined_sequence_embeds = torch.cat(
-                    [text_embeds_one, text_embeds_two], dim=-1
-                ).to(dtype=torch.float16)
-
-                # 填充到T5维度
-                padding_amount = text_embeds_three.shape[-1] - clip_combined_sequence_embeds.shape[-1]
-                if padding_amount > 0:
-                    clip_combined_sequence_embeds_padded = torch.nn.functional.pad(
-                        clip_combined_sequence_embeds, (0, padding_amount), mode='constant', value=0
-                    )
-                else:
-                    clip_combined_sequence_embeds_padded = clip_combined_sequence_embeds
-
-                encoder_hidden_states = torch.cat(
-                    [clip_combined_sequence_embeds_padded, text_embeds_three], dim=-2
-                ).to(dtype=torch.float16)
-
-            # 生成噪声和时间步
-            noise = torch.randn_like(latents).to(device)
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (latents.shape[0],),
-                device=device,
-            ).long()
-
-            # 【关键修复5】SD3 Flow Matching的正确实现 - 添加数值稳定性检查
-            try:
-                # 使用噪声调度器的正确方法
-                sigmas = noise_scheduler.sigmas[timesteps.cpu()].to(device)
-                sigmas = sigmas.reshape(-1, 1, 1, 1)
-                
-                # 【关键修复】添加数值稳定性检查
-                sigmas = torch.clamp(sigmas, min=1e-6, max=1.0 - 1e-6)
-                
-                # SD3使用的是velocity parameterization
-                # v = alpha_t * noise - sigma_t * latents
-                # 其中 alpha_t 和 sigma_t 是从调度器获取的
-                alphas = (1.0 - sigmas).to(torch.float16)
-                alphas = torch.clamp(alphas, min=1e-6, max=1.0 - 1e-6)
-                
-                # 构建噪声图像: x_t = alpha_t * x_0 + sigma_t * noise  
-                noisy_latents = (alphas * latents + sigmas * noise).to(torch.float16)
-                
-                # SD3的目标是velocity: v = alpha_t * noise - sigma_t * latents
-                target = (alphas * noise - sigmas * latents).to(torch.float16)
-
-                # 【关键修复6】检查输入是否包含NaN或Inf
-                if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
-                    print(f"警告: noisy_latents包含NaN或Inf，跳过此批次")
-                    continue
-                    
-                if torch.isnan(target).any() or torch.isinf(target).any():
-                    print(f"警告: target包含NaN或Inf，跳过此批次")
-                    continue
+                sigmas = get_sigmas(
+                    timesteps, n_dim=model_input.ndim, dtype=model_input.dtype
+                )
+                noisy_latents = (1.0 - sigmas) * model_input + sigmas * noise
 
                 model_pred = mmdit(
                     hidden_states=noisy_latents,
                     timestep=timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    pooled_projections=pooled_projections_final,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
                     return_dict=False,
                 )[0]
 
-                # 【关键修复7】检查模型输出
-                if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
-                    print(f"警告: model_pred包含NaN或Inf，跳过此批次")
-                    continue
-
-                loss = torch.nn.functional.mse_loss(
-                    model_pred.float(), target.float(), reduction="mean"
+                weighting = compute_loss_weighting_for_sd3(
+                    weighting_scheme="logit_normal", sigmas=sigmas
                 )
-                
-                # 【关键修复9】检查损失值
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"警告: 损失值为NaN或Inf，跳过此批次")
+                model_pred = model_pred * (-sigmas) + noisy_latents
+                target = model_input
+
+                loss = torch.mean(
+                    (
+                        weighting.float() * (model_pred.float() - target.float()) ** 2
+                    ).reshape(target.shape[0], -1),
+                    1,
+                )
+                loss = loss.mean()
+
+                if torch.isnan(loss):
+                    logger.warning("损失为NaN,跳过此批次")
                     continue
-                    
-                # 【关键修复10】限制损失值范围
-                if loss.item() > 10.0:
-                    print(f"警告: 损失值过大 ({loss.item():.4f})，跳过此批次")
-                    continue
-                
-                # 梯度累积
-                loss = loss / gradient_accumulation_steps
-                loss.backward()
-                
-                # 每gradient_accumulation_steps步或最后一步更新参数
-                if (step + 1) % gradient_accumulation_steps == 0 or (step + 1) == len(dataloader):
-                    # 【修复】添加梯度裁剪 - 【关键修复11】更严格的梯度裁剪
-                    grad_norm = torch.nn.utils.clip_grad_norm_(mmdit.parameters(), max_norm=0.5)
-                    
-                    # 检查梯度范数
-                    if math.isnan(grad_norm) or math.isinf(grad_norm):
-                        print(f"警告: 梯度范数为NaN或Inf，跳过参数更新")
-                        optimizer.zero_grad()
-                        continue
-                    
-                    optimizer.step()
-                    optimizer.zero_grad()
 
-                epoch_loss += loss.item() * gradient_accumulation_steps
-                writer.add_scalar("train/loss", loss.item() * gradient_accumulation_steps, global_step)
-                writer.add_scalar("train/lr", optimizer.param_groups[0]['lr'], global_step)
-                writer.add_scalar("train/grad_norm", grad_norm, global_step)
-                global_step += 1
+                accelerator.backward(loss)
 
-                # 更新进度条
-                progress_bar.set_postfix({
-                    'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-                    'grad_norm': f'{grad_norm:.4f}'
-                })
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        mmdit.parameters(), train_configs.max_grad_norm
+                    )
 
-            except Exception as e:
-                print(f"训练步骤出错: {e}")
+                optimizer.step()
                 optimizer.zero_grad()
-                continue
 
-            # 【修复】内存清理
-            if step % 50 == 0:
-                torch.cuda.empty_cache()
-                gc.collect()
-        
+            logs = {"train_loss": loss.detach().item()}
+            if accelerator.sync_gradients:
+                global_step += 1
+                logs["step"] = global_step
+
+            epoch_loss += loss.detach().item()
+            accelerator.log(logs, step=global_step)
+
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.detach().item():.4f}",
+                    "lr": f'{optimizer.param_groups[0]["lr"]:.2e}',
+                    "step": global_step,
+                }
+            )
+
         avg_loss = epoch_loss / len(dataloader)
-        writer.add_scalar("train/epoch_loss", avg_loss, epoch)
-        print(f"Epoch {epoch+1} 完成. 平均损失: {avg_loss:.4f}")
-        
-        # 【关键修复12】更新学习率调度器
-        scheduler.step(avg_loss)
-        
-        # 【关键修复13】早停机制
-        if avg_loss > 2.0:  # 如果损失过大，提前停止
-            print(f"损失过大 ({avg_loss:.4f})，提前停止训练")
-            break
-        
-        # 【修复】定期保存检查点
-        if (epoch + 1) % 10 == 0 or epoch == train_configs.epochs - 1:
-            lora_save_path = os.path.join(train_configs.output_dir, f"lora_epoch_{epoch+1}")
-            mmdit.save_pretrained(lora_save_path)
-            print(f"LoRA 权重已保存至: {lora_save_path}")
+        accelerator.log({"train_epoch_loss": avg_loss}, step=epoch)
+        logger.info(f"Epoch {epoch+1} 完成. 平均损失: {avg_loss:.4f}")
 
-    # 最终保存
-    final_lora_save_path = os.path.join(train_configs.output_dir, "lora_final")
-    mmdit.save_pretrained(final_lora_save_path)
-    writer.close()
-    print("训练完成. LoRA 权重已保存至", final_lora_save_path)
+        if accelerator.is_main_process and (
+            (epoch + 1) % train_configs.save_every_n_epochs == 0
+            or epoch == train_configs.epochs - 1
+        ):
+            unwrapped_mmdit = accelerator.unwrap_model(mmdit)
+            lora_state_dict = get_peft_model_state_dict(unwrapped_mmdit)
+            cleaned_state_dict = {}
+            for key, value in lora_state_dict.items():
+                if key.startswith("base_model.model."):
+                    new_key = key.replace("base_model.model.", "")
+                    cleaned_state_dict[new_key] = value
+                else:
+                    cleaned_state_dict[key] = value
+
+            lora_save_path = os.path.join(
+                train_configs.output_dir, f"lora_epoch_{epoch+1}"
+            )
+            os.makedirs(lora_save_path, exist_ok=True)
+
+            StableDiffusion3Pipeline.save_lora_weights(
+                save_directory=lora_save_path,
+                transformer_lora_layers=cleaned_state_dict,
+                text_encoder_lora_layers=None,
+                text_encoder_2_lora_layers=None,
+            )
+            logger.info(f"LoRA 权重已保存至: {lora_save_path}")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        unwrapped_mmdit = accelerator.unwrap_model(mmdit)
+        final_lora_state_dict = get_peft_model_state_dict(unwrapped_mmdit)
+        cleaned_state_dict = {}
+        for key, value in final_lora_state_dict.items():
+            if key.startswith("base_model.model."):
+                new_key = key.replace("base_model.model.", "")
+                cleaned_state_dict[new_key] = value
+            else:
+                cleaned_state_dict[key] = value
+
+        final_lora_save_path = os.path.join(train_configs.output_dir, "lora_final")
+        os.makedirs(final_lora_save_path, exist_ok=True)
+
+        StableDiffusion3Pipeline.save_lora_weights(
+            save_directory=final_lora_save_path,
+            transformer_lora_layers=cleaned_state_dict,
+            text_encoder_lora_layers=None,
+            text_encoder_2_lora_layers=None,
+        )
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            f"训练完成. [{current_time}] LoRA 权重已保存至: {final_lora_save_path}"
+        )
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
-    train_parameters_config_path = "./lora_sd3_config.json" 
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    train_parameters_config_path = (
+        "/root/Codes/lora_diffusion/train/lora_sd3_config.json"
+    )
+
     if not os.path.exists(train_parameters_config_path):
         print(f"错误：配置文件 {train_parameters_config_path} 不存在！请创建配置文件。")
         exit()
-        
+
     data_dict = OmegaConf.load(train_parameters_config_path)
     train_configs = TrainParametersConfig(**data_dict)
 
